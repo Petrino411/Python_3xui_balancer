@@ -1,0 +1,34 @@
+[Unit]
+Description=Xray client balancer — sticky-распределение клиентов 3x-ui по балансировщикам
+Documentation=file:/opt/xray-client-balancer/README.md
+After=network-online.target x-ui.service
+Wants=network-online.target
+# Если панель перезапускается, сервис просто переживает недоступность API (retry/backoff).
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/xray-client-balancer/env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/xray-client-balancer/.venv/bin/xray-client-balancer --config /etc/xray-client-balancer/config.yaml daemon
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+# Сервису нужны: доступ к API панели, право читать/писать state.db и backups
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ReadWritePaths=/var/lib/xray-client-balancer /etc/xray-client-balancer
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xray-client-balancer
+# Память: измеренный RSS сервиса ~45 MiB (прогон 2500 циклов, 150 клиентов).
+# 256M — жёсткий предохранитель: при настоящей утечке юнит перезапустится,
+# а не съест память узла. Строку можно ужесточить до 128M.
+MemoryAccounting=true
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

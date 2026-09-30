@@ -1,0 +1,82 @@
+# Конфигурация xray-client-balancer.
+# Секреты в git не храним: api_token берётся из окружения (${XRAY_BALANCER_API_TOKEN}).
+#
+# panel.url должен включать base path панели, если он включён:
+#   на хосте:      cat /etc/x-ui/x-ui.db | <sqlite3|python3> -> settings.webBasePath
+#   пример:        https://127.0.0.1:7119/AbCdEf1234/
+
+panel:
+  url: "https://127.0.0.1:7119/"
+  api_token: "${XRAY_BALANCER_API_TOKEN}"
+  verify_tls: true
+  # ca_bundle: "/root/cert/panel/fullchain.pem"   # если у панели самоподписанный сертификат
+  timeout_seconds: 15
+  retries: 4              # 5s -> 10s -> 20s -> 30s (потолок max_backoff_seconds)
+  backoff_seconds: 5
+  max_backoff_seconds: 30
+
+# Уровень 1: клиент -> sticky assignment -> балансировщик.
+# tag       — имя балансировщика в конфиге Xray
+# primary   — его единственный основной outbound (selector = [primary], без мультиселекта!)
+balancers:
+  - tag: "client-balancer-1"
+    primary: "server-1"
+  - tag: "client-balancer-2"
+    primary: "server-2"
+  - tag: "client-balancer-3"
+    primary: "server-3"
+
+# Уровень 2: физический маршрут. server-4 используется только как fallback.
+fallback:
+  outbound: "server-4"
+
+# Куда сервис вставляет свои правила в routing.rules.
+routing:
+  # bottom | top | after_rule
+  # bottom (по умолчанию) — пользовательские правила сохраняют приоритет;
+  # after_rule — блок сразу после правила, в котором встречается insert_after_rule;
+  # top — блок выше пользовательских правил (панель всё равно поднимает своё api-правило).
+  managed_position: "bottom"
+  insert_after_rule: ""
+  write_rule_tag: true
+
+# Healthcheck Xray, без которого fallbackTag не работает.
+observatory:
+  type: "auto"                                  # auto | observatory | burst
+  probe_url: "https://www.gstatic.com/generate_204"
+  probe_interval: "30s"
+  burst_interval: "30s"
+  burst_timeout: "5s"
+  burst_sampling: 2
+  burst_http_method: "HEAD"
+
+sync:
+  interval_seconds: 30
+
+state:
+  database: "/var/lib/xray-client-balancer/state.db"
+
+backups:
+  enabled: true
+  directory: "/var/lib/xray-client-balancer/backups"
+  keep: 20
+
+safety:
+  refuse_empty_panel: true        # пустой ответ API не считается «клиентов 0»
+  config_repair_attempts: 1       # повторный merge при расхождении после записи
+  churn_breaker_cycles: 3         # 3 цикла подряд с repair -> автозаписи останавливаются
+
+validation:
+  local_xray_test: false          # включить, если сервис стоит на хосте с панелью
+  xray_binary: "/usr/local/x-ui/bin/xray-linux-amd64"
+  route_test: true                # после записи спросить у ядра маршрут по одному клиенту из группы
+  route_test_domain: "example.com"
+
+# Клиенты, которых сервис не трогает вообще.
+exclude_clients:
+  - "admin@example"
+exclude_regex:
+  - "^test-"
+
+# disabled/expired/закончившийся трафик: назначение сохраняем (клиент вернётся в свою группу)
+include_disabled: true

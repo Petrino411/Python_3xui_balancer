@@ -1,0 +1,2 @@
+[console_scripts]
+xray-client-balancer = xray_client_balancer.main:main

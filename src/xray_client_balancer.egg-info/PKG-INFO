@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: xray-client-balancer
+Version: 1.0.0
+Summary: Sticky-распределение клиентов 3x-ui по балансировщикам Xray (client-balancer-1..3 + fallback)
+License: MIT
+Requires-Python: >=3.11
+Requires-Dist: httpx>=0.27
+Requires-Dist: pydantic>=2.6
+Requires-Dist: PyYAML>=6.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
