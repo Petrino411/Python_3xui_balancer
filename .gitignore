@@ -1,3 +1,5 @@
-
-/tests/__pycache__
-/src/xray_client_balancer/__pycache__
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/

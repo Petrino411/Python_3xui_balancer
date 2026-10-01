@@ -9,7 +9,9 @@ Wants=network-online.target
 Type=simple
 EnvironmentFile=-/etc/xray-client-balancer/env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/xray-client-balancer/.venv/bin/xray-client-balancer --config /etc/xray-client-balancer/config.yaml daemon
+# Обёртка сама выбирает интерпретатор (venv или python3 с deps) и читает env-файл,
+# поэтому путь один и тот же независимо от способа установки зависимостей.
+ExecStart=/usr/local/bin/xcb --config /etc/xray-client-balancer/config.yaml daemon
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5

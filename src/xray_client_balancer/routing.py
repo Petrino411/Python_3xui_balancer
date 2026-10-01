@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
 from .config import ObservatoryConfigModel, RoutingConfig
-from .models import BalancerSpec, sort_emails
+from .models import BALANCER_TAG_PREFIX, BalancerSpec, sort_emails
 
 logger = logging.getLogger(__name__)
 
@@ -275,6 +275,76 @@ def apply_observatory(
         section["probeInterval"] = obs.probe_interval
     new_template["observatory"] = section
     return new_template, required
+
+
+def is_service_tag(
+    tag: Any, balancer_tags: Iterable[str], prefix: str = BALANCER_TAG_PREFIX
+) -> bool:
+    """Наш ли это тег балансировщика: из конфига сервиса или с нашим префиксом.
+
+    Второе нужно команде `reset`: группа, которую убрали из `config.yaml`, уже не
+    попадает в набор тегов, но её балансировщик и правило в панели — по-прежнему
+    наши, и оставлять правило со ссылкой на несуществующий балансировщик нельзя
+    (ядро такой конфиг отвергнет).
+    """
+    text = str(tag or "")
+    return text in set(balancer_tags) or (bool(prefix) and text.startswith(prefix))
+
+
+def strip_managed(
+    template: Mapping[str, Any],
+    balancer_tags: Iterable[str],
+    observatory_tags: Iterable[str] = (),
+    *,
+    prefix: str = BALANCER_TAG_PREFIX,
+) -> dict[str, Any]:
+    """Убрать из шаблона всё, что создал сервис: свои правила, балансировщики, теги.
+
+    Нужно команде `reset` («начать с нуля»): без этого сервис сохранил бы прежнюю
+    позицию своего блока и прежние точки вставки, а с нуля должен собрать блок так,
+    как если бы он в этом конфиге ещё не работал. Чужие правила и чужие
+    балансировщики не трогаются — их отсекают те же признаки, что и при записи
+    (balancerTag из конфига, comment `xcb-managed:`), плюс префикс имён сервиса.
+    """
+    new_template = json.loads(json.dumps(template))
+    tags = list(balancer_tags)
+    section = new_template.get("routing")
+    if isinstance(section, dict):
+        rules = section.get("rules")
+        if isinstance(rules, list):
+            section["rules"] = [
+                rule
+                for rule in rules
+                if not (
+                    isinstance(rule, dict)
+                    and (
+                        is_managed_rule(rule, tags)
+                        or is_service_tag(rule.get("balancerTag"), tags, prefix)
+                    )
+                )
+            ]
+        balancers = section.get("balancers")
+        if isinstance(balancers, list):
+            section["balancers"] = [
+                bal
+                for bal in balancers
+                if not (isinstance(bal, dict) and is_service_tag(bal.get("tag"), tags, prefix))
+            ]
+
+    ours = set(observatory_tags)
+    for name in OBSERVATORY_SECTIONS:
+        section_obj = new_template.get(name)
+        if not isinstance(section_obj, dict):
+            continue
+        remaining = [
+            str(tag) for tag in (section_obj.get("subjectSelector") or []) if str(tag) not in ours
+        ]
+        if remaining or not set(section_obj.keys()) <= OBSERVATORY_STANDARD_KEYS.get(name, set()):
+            section_obj["subjectSelector"] = remaining
+            continue
+        # секция была создана только сервисом (её «чужой» проекции нет) — убираем целиком
+        new_template.pop(name, None)
+    return new_template
 
 
 # --------------------------------------------------------------------- validation

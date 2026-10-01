@@ -173,6 +173,18 @@ class StateStore:
 
     # ------------------------------------------------------------------ meta
 
+    def reset_state(self) -> dict[str, int]:
+        """Полностью очистить локальное состояние: назначения и защитные счётчики.
+
+        Используется командой `reset` («начать с нуля»): после неё клиенты
+        раскладываются заново, а счётчики вроде churn-предохранителя не мешают
+        первой записи. Схема БД (schema_version) остаётся — база не меняется.
+        """
+        with self.transaction() as conn:
+            removed = conn.execute("DELETE FROM client_assignments").rowcount
+            conn.execute("DELETE FROM meta WHERE key <> 'schema_version'")
+        return {"assignments_removed": max(0, int(removed))}
+
     def get_meta(self, key: str) -> str | None:
         row = self._conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return str(row["value"]) if row else None

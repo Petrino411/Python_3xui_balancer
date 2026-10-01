@@ -58,9 +58,32 @@ def test_global_keys_work_after_new_subcommands() -> None:
         ["clients", "--config", "/etc/xcb/config.yaml"],
         ["balancers", "--config", "/etc/xcb/config.yaml"],
         ["doctor", "--config", "/etc/xcb/config.yaml"],
+        ["reset", "--config", "/etc/xcb/config.yaml"],
+        ["init", "--config", "/etc/xcb/config.yaml", "--list-only"],
+        ["outbounds", "--config", "/etc/xcb/config.yaml"],
     ):
         args = build_parser().parse_args(argv)
         assert args.config == "/etc/xcb/config.yaml"
+
+
+def test_setup_subcommands_parse() -> None:
+    """init/outbounds/reset: ключи и признак «конфига может ещё не быть»."""
+    init = build_parser().parse_args(
+        ["init", "--primary", "sub1,sub2", "--fallback", "sub3", "--yes", "--force", "--start"]
+    )
+    assert init.primary == "sub1,sub2" and init.fallback == "sub3"
+    assert init.yes and init.force and init.start
+    assert init.needs_config is False
+    assert init.strategy == "leastLoad" and init.state_db is None
+
+    outbounds = build_parser().parse_args(["outbounds", "--all", "--json", "--panel-url", "http://x/"])
+    assert outbounds.all and outbounds.as_json and outbounds.panel_url == "http://x/"
+    assert outbounds.needs_config is False
+
+    reset = build_parser().parse_args(["reset"])
+    assert reset.yes is False
+    # у reset признака нет — значит main() требует конфиг (значение по умолчанию)
+    assert getattr(reset, "needs_config", True) is True
 
 
 def test_clients_balancers_doctor_options() -> None:

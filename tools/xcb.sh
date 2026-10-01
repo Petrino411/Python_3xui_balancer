@@ -13,8 +13,13 @@ ENV_FILE=/etc/xray-client-balancer/env
 ROOT=/opt/xray-client-balancer
 
 if [ -r "$ENV_FILE" ]; then
+    # set -a: переменные из env-файла должны попасть в окружение python-процесса.
+    # Без этого `VAR=значение` в файле остаётся переменной шелла обёртки и дочерний
+    # процесс её не видит ("не задан API-токен") — проверено на живом узле.
+    set -a
     # shellcheck disable=SC1090
     . "$ENV_FILE"
+    set +a
 fi
 
 PYTHONPATH="$ROOT/src:$ROOT/deps${PYTHONPATH:+:$PYTHONPATH}"

@@ -559,6 +559,14 @@ class BalancerService:
             problems.append("ядро не поднялось даже после отката — нужен разбор вручную")
         return problems
 
+    def rollback_to(self, previous: Mapping[str, Any], backup: Path | None = None) -> list[str]:
+        """Публичный откат к предыдущему шаблону (нужен команде `reset`).
+
+        Команда `reset` пишет конфиг сама (а не через цикл `sync`), поэтому и
+        откат на неудачной записи должен уметь вызвать кто-то снаружи.
+        """
+        return self._rollback(previous, backup)
+
     def _confirm_write(
         self,
         candidate: Mapping[str, Any],
@@ -678,6 +686,10 @@ class BalancerService:
         logger.info("xray -test: кандидат конфига валиден")
         return []
 
+    def known_outbound_tags(self) -> set[str]:
+        """Публичный доступ к outbound-тегам ядра (нужен командам `init`/`reset`)."""
+        return self._known_outbound_tags()
+
     def _known_outbound_tags(self) -> set[str]:
         """Outbound-теги, доступные ядру: шаблон + работающий конфиг + кэш.
 
@@ -709,6 +721,10 @@ class BalancerService:
         except PanelError:
             return []
         return [str(i.get("tag")) for i in (section.get("inbounds") or []) if isinstance(i, dict) and i.get("tag")]
+
+    def verify_routes(self, groups: Mapping[str, Sequence[str]]) -> list[str]:
+        """Публичная проверка маршрутов через routeTest (нужна команде `reset`)."""
+        return self._verify_routes(groups)
 
     def _verify_routes(self, groups: Mapping[str, Sequence[str]]) -> list[str]:
         """§43: спросить у ядра по одному клиенту из каждой группы, куда он пойдёт.

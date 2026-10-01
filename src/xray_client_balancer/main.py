@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Sequence
 
 from . import __version__, health, routing
 from .allocator import rebalance_assignments, rebalance_diff
 from .api import PanelApi, PanelError
-from .config import AppConfig, ConfigError, load_config
+from .config import AppConfig, ConfigError, DEFAULT_CONFIG_PATH, load_config
 from .database import StateStore
 from .models import Assignment, PanelClient, group_assignments
 from .ops import (
@@ -614,6 +616,338 @@ def cmd_check_api(config: AppConfig, args: argparse.Namespace) -> int:
     return run_checks(config, verbose=args.verbose)
 
 
+def _optional_config(args: argparse.Namespace) -> AppConfig | None:
+    """Конфиг, если он уже создан: `init` и `outbounds` работают и до появления файла."""
+    try:
+        return load_config(args.config)
+    except ConfigError:
+        return None
+
+
+def _confirm(question: str, *, assume_yes: bool) -> bool:
+    """Спросить подтверждение. Без TTY (скрипт, cron) отвечать некому — нужен --yes."""
+    from . import setup as setup_mod
+
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        print(f"{question} — нет терминала: повторите с --yes", file=sys.stderr)
+        return False
+    answer = setup_mod.ask(f"{question} [y/N]: ").strip().lower()
+    return answer in ("y", "yes", "д", "да")
+
+
+def cmd_outbounds(config: AppConfig | None, args: argparse.Namespace) -> int:
+    """Показать исходящие панели — то, из чего собираются балансировщики."""
+    from . import setup as setup_mod
+
+    try:
+        panel = setup_mod.resolve_panel_config(
+            config=config, url=args.panel_url, insecure=args.insecure
+        )
+    except (ConfigError, setup_mod.SetupError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    try:
+        with setup_mod.open_panel(panel) as api:
+            print(f"Панель: {panel.url}")
+            items = setup_mod.fetch_outbounds(api, include_internal=args.all)
+    except PanelError as exc:
+        print(f"ERROR: панель недоступна: {exc}", file=sys.stderr)
+        return 1
+
+    if args.as_json:
+        print(setup_mod.dump_outbounds(items))
+        return 0
+    print("")
+    print(f"Исходящие ({len(items)}):")
+    print(setup_mod.render_outbounds(items))
+    if not args.all:
+        print("")
+        print("Служебные (direct/blackhole/dns/…) скрыты — покажите их ключом --all.")
+    return 0
+
+
+def cmd_init(config: AppConfig | None, args: argparse.Namespace) -> int:
+    """Найти исходящие, дать выбрать нужные и собрать конфиг.
+
+    Единственная команда, после которой сервис уже работает: она пишет
+    config.yaml и сразу делает первую синхронизацию — балансировщики и правила
+    routing создаёт сам сервис, руками в панели ничего делать не нужно.
+    """
+    from . import setup as setup_mod
+
+    path = Path(args.config or os.environ.get("XCB_CONFIG") or DEFAULT_CONFIG_PATH)
+    print("Настройка xray-client-balancer")
+    print("")
+    if path.exists() and not args.force:
+        print(f"Конфиг уже существует: {path}")
+        print("Перезаписать его: xcb init --force (прежний файл будет сохранён рядом с .bak)")
+        return 1
+    if path.exists() and args.force:
+        backup = path.with_suffix(path.suffix + ".bak")
+        backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"Прежний конфиг сохранён: {backup}")
+        print("")
+    if path.exists() and config is None:
+        print(f"ВНИМАНИЕ: {path} существует, но не читается как конфиг —")
+        print("          беру адрес панели из окружения или с узла")
+        print("")
+
+    try:
+        panel = setup_mod.resolve_panel_config(
+            config=config,
+            url=args.panel_url,
+            insecure=args.insecure,
+            print_fn=print,
+        )
+    except (ConfigError, setup_mod.SetupError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Панель: {panel.url}")
+    try:
+        with setup_mod.open_panel(panel) as api:
+            items = setup_mod.fetch_outbounds(api, include_internal=args.all)
+    except PanelError as exc:
+        print(f"ERROR: панель недоступна: {exc}", file=sys.stderr)
+        return 1
+
+    if not items:
+        print(
+            "ERROR: у панели не нашлось ни одного исходящего. Сначала создайте их в панели "
+            "(Исходящие → добавить), затем повторите xcb init.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print("")
+    print(f"Исходящие панели ({len(items)}):")
+    print(setup_mod.render_outbounds(items))
+    if args.list_only:
+        return 0
+
+    try:
+        if args.primary:
+            primaries = setup_mod.parse_selection(args.primary, [i.tag for i in items])
+        elif args.yes:
+            print("ERROR: с --yes нужно указать балансировщики: --primary tag1,tag2", file=sys.stderr)
+            return 1
+        else:
+            primaries = setup_mod.choose_primaries(items)
+        if args.fallback:
+            fallback = args.fallback.strip()
+            if fallback not in [i.tag for i in items]:
+                fallback = setup_mod.parse_selection(fallback, [i.tag for i in items])[0]
+        elif args.yes:
+            print("ERROR: с --yes нужно указать резерв: --fallback tag", file=sys.stderr)
+            return 1
+        else:
+            fallback = setup_mod.choose_fallback(items, primaries)
+        document = setup_mod.build_config_document(
+            panel.url,
+            primaries,
+            fallback,
+            strategy=args.strategy,
+            verify_tls=panel.verify_tls,
+            ca_bundle=panel.ca_bundle,
+            tls_verify_hostname=panel.tls_verify_hostname,
+            state_database=args.state_db,
+            backups_directory=args.backups_dir,
+        )
+    except setup_mod.SetupError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    new_config = AppConfig.model_validate(document)
+    print("")
+    print("Будет создано:")
+    for balancer in new_config.balancers:
+        print(f"  {balancer.tag} -> {balancer.primary}  (резерв: {new_config.fallback.outbound})")
+    print("")
+    if not _confirm(f"Записать конфиг в {path} и применить это в панели?", assume_yes=args.yes):
+        print("Ничего не изменено.")
+        return 0
+
+    setup_mod.write_config(path, document)
+    print("")
+    print(f"Конфиг записан: {path}")
+
+    if args.no_sync:
+        print("")
+        print("Синхронизация пропущена (--no-sync). Дальше: xcb sync")
+        return 0
+
+    # дальнейшая работа идёт по записанному файлу: в нём подстановка ${...},
+    # которую сервис разворачивает из окружения — как это сделает демон
+    service_config = load_config(path)
+    service, store, api = build_service(service_config)
+    try:
+        report = service.sync(dry_run=args.dry_run)
+        print("")
+        print(report.render(service_config))
+        if report.errors:
+            return 1
+    finally:
+        store.close()
+        api.close()
+
+    print("")
+    print("Готово. Дальше:")
+    print("  systemctl enable --now xray-client-balancer   # постоянная синхронизация")
+    print("  xcb status                                    # распределение и живые балансировщики")
+    if args.start:
+        print("")
+        return _start_daemon()
+    return 0
+
+
+def _start_daemon() -> int:
+    """Включить и запустить юнит — только когда об этом попросили ключом --start."""
+    import subprocess
+
+    result = subprocess.run(
+        ["systemctl", "enable", "--now", "xray-client-balancer"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        print(
+            f"ERROR: systemctl вернул {result.returncode}: "
+            f"{(result.stderr or result.stdout).strip()}",
+            file=sys.stderr,
+        )
+        return 1
+    print("Служба xray-client-balancer включена и запущена.")
+    return 0
+
+
+def cmd_reset(config: AppConfig, args: argparse.Namespace) -> int:
+    """Полная перенастройка с нуля одной командой.
+
+    Свои балансировщики и правила удаляются из конфига, локальное состояние
+    (назначения и защитные счётчики) очищается, все клиенты раскладываются заново
+    по группам из конфига — и всё это одной записью в панель.
+    """
+    service, store, api = build_service(config)
+    tags = service.balancer_tags
+    try:
+        try:
+            clients = [c for c in service.fetch_clients() if config.include_disabled or c.active]
+        except PanelError as exc:
+            print(f"ERROR: не удалось получить список клиентов: {exc}", file=sys.stderr)
+            return 1
+        clients = [c for c in clients if not config.is_excluded(c.email)]
+        try:
+            template = api.get_xray_template()
+        except PanelError as exc:
+            print(f"ERROR: не удалось прочитать конфиг панели: {exc}", file=sys.stderr)
+            return 1
+
+        if not clients:
+            print("Клиентов в панели нет: будут пересобраны только свои правила и балансировщики.")
+
+        by_id = {c.client_id: c.email for c in clients}
+        target = rebalance_assignments(clients, service.specs) if clients else {}
+        groups = group_assignments(
+            [
+                Assignment(client_id=cid, email=by_id[cid], balancer_tag=tag, created_at=0, updated_at=0)
+                for cid, tag in target.items()
+            ],
+            tags,
+        )
+        clean = routing.strip_managed(template, tags, service.observatory_tags)
+        candidate = service.build_candidate(clean, groups)
+        problems = routing.validate_candidate(
+            candidate, groups, service.specs, known_outbound_tags=service.known_outbound_tags()
+        )
+
+        print("Полная перенастройка с нуля")
+        print("")
+        print(f"  групп: {len(tags)} ({', '.join(tags)})")
+        print(f"  резерв: {config.fallback.outbound}")
+        print(f"  клиентов будет разложено заново: {len(target)}")
+        print(f"  свои правила в конфиге: было {len(routing.describe_managed_block(template, tags))}")
+        print("")
+        counts: dict[str, int] = {tag: 0 for tag in tags}
+        for tag in target.values():
+            counts[tag] += 1
+        _print_distribution(config, counts, "Раскладка после перенастройки:")
+        print("")
+
+        if problems:
+            for problem in problems:
+                print(f"ERROR: {problem}", file=sys.stderr)
+            print("Ничего не изменено: сначала приведите конфиг и outbound'ы в порядок.", file=sys.stderr)
+            return 1
+        if routing.template_changed(template, candidate):
+            print("Конфиг в панели будет перезаписан (один раз, с бэкапом).")
+        else:
+            print("Routing уже соответствует — перезаписываться не будет.")
+        print("Локальные назначения будут пересобраны заново.")
+
+        if not args.yes:
+            print("")
+            print("Это только план. Применить: xcb reset --yes")
+            return 0
+
+        backup = service.backups.save(template, note="before reset")
+        store.reset_state()
+        if target:
+            store.replace_all({cid: (by_id[cid], tag) for cid, tag in target.items()})
+
+        if not routing.template_changed(template, candidate):
+            print("")
+            print("Routing не изменился, запись не потребовалась; назначения пересобраны.")
+            return 0
+
+        try:
+            api.update_xray_template(candidate)
+        except PanelError as exc:
+            print(f"ERROR: панель не приняла конфиг: {exc}", file=sys.stderr)
+            print(
+                "Локальные назначения уже пересобраны — следующий sync допишет конфиг сам.",
+                file=sys.stderr,
+            )
+            return 1
+
+        if not api.wait_until_xray_ready(config.safety.xray_ready_timeout):
+            state = {}
+            try:
+                state = api.xray_state()
+            except PanelError:
+                pass
+            print(
+                f"CRITICAL: ядро не поднялось после записи (state={state.get('state')!r}) — "
+                "возвращаю прежний конфиг",
+                file=sys.stderr,
+            )
+            problems = service.rollback_to(template, backup)
+            for problem in problems:
+                print(f"  {problem}", file=sys.stderr)
+            return 1
+
+        # запись сделана напрямую, поэтому метки состояния обновляем здесь же:
+        # иначе `status` после перенастройки показывал бы «never» и нулевой счётчик
+        now = str(int(time.time()))
+        store.bump_meta_counter(META_CONFIG_WRITES)
+        store.set_meta(META_LAST_CONFIG_UPDATE, now)
+        store.set_meta(META_LAST_SYNC, now)
+        store.set_meta(META_LAST_ERROR, "")
+
+        print("")
+        print("Перенастройка выполнена: конфиг панели и локальные назначения пересобраны.")
+        if config.validation.route_test:
+            for problem in service.verify_routes(groups):
+                print(f"ERROR: {problem}", file=sys.stderr)
+            print("Проверка маршрутов: см. журнал (routeTest по одному клиенту из группы).")
+        return 0
+    finally:
+        store.close()
+        api.close()
+
+
 # --------------------------------------------------------------------------- entry
 
 
@@ -711,6 +1045,62 @@ def build_parser() -> argparse.ArgumentParser:
     p_check.add_argument("--verbose", action="store_true", help="печатать детали ответов (без секретов)")
     p_check.set_defaults(func=cmd_check_api)
 
+    # init/outbounds не требуют существующего конфига: они его как раз и создают
+    p_outbounds = sub.add_parser(
+        "outbounds",
+        parents=[common],
+        help="показать исходящие панели (кандидаты в балансировщики)",
+    )
+    p_outbounds.add_argument("--panel-url", default=None, help="URL панели (по умолчанию — из конфига/env)")
+    p_outbounds.add_argument("--insecure", action="store_true", help="не проверять TLS-сертификат панели")
+    p_outbounds.add_argument("--all", action="store_true", help="показать и служебные (direct/blackhole/dns)")
+    p_outbounds.add_argument("--json", dest="as_json", action="store_true", help="машинный вывод (JSON)")
+    p_outbounds.set_defaults(func=cmd_outbounds, needs_config=False)
+
+    p_init = sub.add_parser(
+        "init",
+        parents=[common],
+        help="найти исходящие, выбрать нужные и создать конфиг",
+        description=(
+            "Первичная настройка: сервис читает исходящие панели, даёт выбрать, какие\n"
+            "станут балансировщиками и какой — общим резервом, записывает config.yaml и\n"
+            "сразу создаёт балансировщики и правила routing в панели.\n"
+            "Примеры:\n"
+            "  xcb init                       # спросит про каждый шаг\n"
+            "  xcb init --list-only           # только показать исходящие\n"
+            "  xcb init --primary sub1,sub2 --fallback sub3 --yes   # без вопросов"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_init.add_argument("--panel-url", default=None, help="URL панели (по умолчанию — автоопределение/из env)")
+    p_init.add_argument("--insecure", action="store_true", help="не проверять TLS-сертификат панели")
+    p_init.add_argument("--primary", default=None, help="балансировщики: номера или теги через запятую")
+    p_init.add_argument("--fallback", default=None, help="общий резерв: номер или тег")
+    p_init.add_argument("--strategy", default="leastLoad", help="стратегия Xray для групп (по умолчанию leastLoad)")
+    p_init.add_argument("--all", action="store_true", help="включить в список выбора служебные исходящие")
+    p_init.add_argument("--state-db", default=None, help="путь к state.db (по умолчанию /var/lib/xray-client-balancer/state.db)")
+    p_init.add_argument("--backups-dir", default=None, help="каталог бэкапов (по умолчанию /var/lib/xray-client-balancer/backups)")
+    p_init.add_argument("--list-only", action="store_true", help="только показать исходящие и выйти")
+    p_init.add_argument("--force", action="store_true", help="перезаписать существующий конфиг (с сохранением .bak)")
+    p_init.add_argument("--yes", action="store_true", help="не задавать вопросов (нужны --primary и --fallback)")
+    p_init.add_argument("--no-sync", action="store_true", help="только создать конфиг, в панель не писать")
+    p_init.add_argument("--dry-run", action="store_true", help="не менять панель: показать план синхронизации")
+    p_init.add_argument("--start", action="store_true", help="после настройки включить и запустить службу")
+    p_init.set_defaults(func=cmd_init, needs_config=False)
+
+    p_reset = sub.add_parser(
+        "reset",
+        parents=[common],
+        help="полная перенастройка с нуля одной командой",
+        description=(
+            "Сносит свои балансировщики и правила в панели, очищает локальные назначения\n"
+            "и раскладывает всех клиентов заново по группам из config.yaml. По умолчанию\n"
+            "показывает план; применяется с --yes."
+        ),
+    )
+    p_reset.add_argument("--yes", action="store_true", help="применить (иначе только план)")
+    p_reset.set_defaults(func=cmd_reset)
+
     return parser
 
 
@@ -721,16 +1111,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.print_help()
         return 2
     setup_logging(args.log_level)
-    try:
-        config = load_config(args.config)
-    except ConfigError as exc:
-        logger.error("Конфигурация: %s", exc)
-        return 2
+    config: AppConfig | None
+    if getattr(args, "needs_config", True):
+        try:
+            config = load_config(args.config)
+        except ConfigError as exc:
+            logger.error("Конфигурация: %s", exc)
+            return 2
+    else:
+        # init/outbounds работают и до появления конфига: его ещё нет
+        config = _optional_config(args)
     try:
         return int(args.func(config, args))
     except ConfigError as exc:
         # например панель недоступна как *конфигурация*: нет токена или битый ca_bundle
         logger.error("Конфигурация: %s", exc)
+        if str(exc).startswith("конфигурация не найдена"):
+            logger.error("Сервис ещё не настроен — выполните: xcb init")
         return 2
     except KeyboardInterrupt:  # pragma: no cover
         return 130
